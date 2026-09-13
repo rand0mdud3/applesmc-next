@@ -7,9 +7,6 @@
  * Copyright (C) 2007 Nicolas Boichat <nicolas@boichat.ch>
  * Copyright (C) 2010 Henrik Rydberg <rydberg@euromail.se>
  *
- * Add charge threshold support:
- * Copyright (C) 2023 Chris Osgood <chris_github@functionalfuture.com>
- *
  * Based on hdaps.c driver:
  * Copyright (C) 2005 Robert Love <rml@novell.com>
  * Copyright (C) 2005 Jesper Juhl <jj@chaosbits.net>
@@ -20,8 +17,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#include <linux/version.h>
-
+#include <acpi/battery.h>
 #include <linux/delay.h>
 #include <linux/platform_device.h>
 #include <linux/input.h>
@@ -38,9 +34,6 @@
 #include <linux/workqueue.h>
 #include <linux/err.h>
 #include <linux/bits.h>
-
-#include <acpi/battery.h>
-#include <acpi/sbs.h>
 
 /* data port used by Apple SMC */
 #define APPLESMC_DATA_PORT	0x300
@@ -72,6 +65,9 @@
 
 #define CLAMSHELL_KEY		"MSLD" /* r-o ui8 (unused) */
 
+#define CHARGE_END_KEY		"BCLM" /* r-w ui8 */
+#define CHARGE_FULL_KEY		"BFCL" /* r-w ui8 */
+
 #define MOTION_SENSOR_X_KEY	"MO_X" /* r-o sp78 (2 bytes) */
 #define MOTION_SENSOR_Y_KEY	"MO_Y" /* r-o sp78 (2 bytes) */
 #define MOTION_SENSOR_Z_KEY	"MO_Z" /* r-o sp78 (2 bytes) */
@@ -82,9 +78,6 @@
 #define FAN_ID_FMT		"F%dID" /* r-o char[16] */
 
 #define TEMP_SENSOR_TYPE	"sp78"
-
-#define CHARGE_END_KEY		"BCLM" /* r-w ui8 */
-#define CHARGE_FULL_KEY		"BFCL" /* r-w ui8 */
 
 /* List of keys used to read/write fan speeds */
 static const char *const fan_speed_fmt[] = {
@@ -597,7 +590,7 @@ static int applesmc_init_smcreg_try(void)
 	s->key_count = count;
 
 	if (!s->cache)
-		s->cache = kcalloc(s->key_count, sizeof(*s->cache), GFP_KERNEL);
+		s->cache = kzalloc_objs(*s->cache, s->key_count);
 	if (!s->cache)
 		return -ENOMEM;
 
@@ -679,6 +672,153 @@ static int applesmc_init_smcreg(void)
 	return ret;
 }
 
+/* Battery charge thresholds via SMC BCLM/BFCL keys.
+ *
+ * Registers an ACPI battery hook so the standard charge_control_* sysfs
+ * files appear on the battery device. Reads and writes go through this
+ * driver's own SMC accessors under smcreg.mutex, like every other node.
+ */
+static ssize_t applesmc_percent_show(const char *key, struct device *dev,
+				struct device_attribute *attr, char *sysfsbuf)
+{
+	u8 val[1];
+	int ret;
+
+	mutex_lock(&smcreg.mutex);
+	ret = read_smc(APPLESMC_READ_CMD, key, val, sizeof(val));
+	mutex_unlock(&smcreg.mutex);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(sysfsbuf, "%d\n", val[0]);
+}
+
+static ssize_t applesmc_percent_store(const char *key, struct device *dev,
+				struct device_attribute *attr,
+				const char *sysfsbuf, size_t count)
+{
+	u8 buf[1];
+	unsigned long val;
+	int ret;
+
+	if (kstrtoul(sysfsbuf, 10, &val) < 0 || val < 1 || val > 100)
+		return -EINVAL;
+
+	buf[0] = (u8)val;
+
+	mutex_lock(&smcreg.mutex);
+	ret = write_smc(APPLESMC_WRITE_CMD, key, buf, sizeof(buf));
+	mutex_unlock(&smcreg.mutex);
+
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static ssize_t charge_control_start_threshold_show(struct device *dev,
+				struct device_attribute *attr, char *sysfsbuf)
+{
+	/* No start key is implemented; report disabled for TLP compatibility. */
+	return sysfs_emit(sysfsbuf, "0\n");
+}
+
+static ssize_t charge_control_end_threshold_show(struct device *dev,
+				struct device_attribute *attr, char *sysfsbuf)
+{
+	return applesmc_percent_show(CHARGE_END_KEY, dev, attr, sysfsbuf);
+}
+
+static ssize_t charge_control_end_threshold_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *sysfsbuf, size_t count)
+{
+	return applesmc_percent_store(CHARGE_END_KEY,
+					dev, attr, sysfsbuf, count);
+}
+
+static ssize_t charge_control_full_threshold_show(struct device *dev,
+				struct device_attribute *attr, char *sysfsbuf)
+{
+	return applesmc_percent_show(CHARGE_FULL_KEY,
+					dev, attr, sysfsbuf);
+}
+
+static ssize_t charge_control_full_threshold_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *sysfsbuf, size_t count)
+{
+	return applesmc_percent_store(CHARGE_FULL_KEY,
+					dev, attr, sysfsbuf, count);
+}
+
+static DEVICE_ATTR_RO(charge_control_start_threshold);
+static DEVICE_ATTR_RW(charge_control_end_threshold);
+static DEVICE_ATTR_RW(charge_control_full_threshold);
+
+static int applesmc_battery_add(struct power_supply *battery,
+				struct acpi_battery_hook *hook)
+{
+	int ret;
+
+	pr_debug("Battery added: %s\n", battery->desc->name);
+
+	ret = device_create_file(&battery->dev,
+				 &dev_attr_charge_control_start_threshold);
+	if (ret)
+		return ret;
+
+	ret = device_create_file(&battery->dev,
+				 &dev_attr_charge_control_end_threshold);
+	if (ret)
+		goto out_start;
+
+	ret = device_create_file(&battery->dev,
+				 &dev_attr_charge_control_full_threshold);
+	if (ret)
+		goto out_end;
+
+	return 0;
+
+out_end:
+	device_remove_file(&battery->dev,
+			   &dev_attr_charge_control_end_threshold);
+out_start:
+	device_remove_file(&battery->dev,
+			   &dev_attr_charge_control_start_threshold);
+	return ret;
+}
+
+static int applesmc_battery_remove(struct power_supply *battery,
+				   struct acpi_battery_hook *hook)
+{
+	pr_debug("Battery removed: %s\n", battery->desc->name);
+
+	device_remove_file(&battery->dev,
+			   &dev_attr_charge_control_full_threshold);
+	device_remove_file(&battery->dev,
+			   &dev_attr_charge_control_end_threshold);
+	device_remove_file(&battery->dev,
+			   &dev_attr_charge_control_start_threshold);
+	return 0;
+}
+
+static struct acpi_battery_hook battery_hook = {
+	.add_battery = applesmc_battery_add,
+	.remove_battery = applesmc_battery_remove,
+	.name = "AppleSMC Battery Charge Extension",
+};
+
+static void applesmc_battery_init(void)
+{
+	battery_hook_register(&battery_hook);
+}
+
+static void applesmc_battery_exit(void)
+{
+	battery_hook_unregister(&battery_hook);
+}
+
 /* Device model stuff */
 static int applesmc_probe(struct platform_device *dev)
 {
@@ -689,6 +829,8 @@ static int applesmc_probe(struct platform_device *dev)
 		return ret;
 
 	applesmc_device_init();
+
+	applesmc_battery_init();
 
 	return 0;
 }
@@ -1077,28 +1219,6 @@ static ssize_t applesmc_key_at_index_store(struct device *dev,
 	return count;
 }
 
-static ssize_t applesmc_key_at_index_write_store(struct device *dev,
-	struct device_attribute *attr, const char *sysfsbuf, size_t count)
-{
-#ifndef APPLESMC_ALLOW_STORE_ANY
-	return -EPERM;
-#else
-	const struct applesmc_entry *entry;
-	int ret;
-
-	entry = applesmc_get_entry_by_index(key_at_index);
-	if (IS_ERR(entry))
-		return PTR_ERR(entry);
-	else if (entry->len != count)
-		return -EINVAL;
-	ret = applesmc_write_entry(entry, sysfsbuf, count);
-	if (ret)
-		return ret;
-
-	return count;
-#endif /* APPLESMC_ALLOW_STORE_ANY */
-}
-
 static struct led_classdev applesmc_backlight = {
 	.name			= "smc::kbd_backlight",
 	.default_trigger	= "nand-disk",
@@ -1112,7 +1232,7 @@ static struct applesmc_node_group info_group[] = {
 	{ "key_at_index_name", applesmc_key_at_index_name_show },
 	{ "key_at_index_type", applesmc_key_at_index_type_show },
 	{ "key_at_index_data_length", applesmc_key_at_index_data_length_show },
-	{ "key_at_index_data", applesmc_key_at_index_read_show, applesmc_key_at_index_write_store },
+	{ "key_at_index_data", applesmc_key_at_index_read_show },
 	{ }
 };
 
@@ -1174,7 +1294,7 @@ static int applesmc_create_nodes(struct applesmc_node_group *groups, int num)
 	int ret, i;
 
 	for (grp = groups; grp->format; grp++) {
-		grp->nodes = kcalloc(num + 1, sizeof(*node), GFP_KERNEL);
+		grp->nodes = kzalloc_objs(*node, num + 1);
 		if (!grp->nodes) {
 			ret = -ENOMEM;
 			goto out;
@@ -1202,148 +1322,6 @@ static int applesmc_create_nodes(struct applesmc_node_group *groups, int num)
 out:
 	applesmc_destroy_nodes(groups);
 	return ret;
-}
-
-/* Create battery resources by hooking ACPI SBS */
-
-static ssize_t applesmc_percent_show(const char *key, struct device *dev,
-				struct device_attribute *attr, char *sysfsbuf)
-{
-	u8 val[1];
-	int ret;
-
-	ret = read_smc(APPLESMC_READ_CMD, key, val, sizeof(val));
-	if (ret)
-		return ret;
-
-	return sysfs_emit(sysfsbuf, "%d\n", val[0]);
-}
-
-static ssize_t applesmc_percent_store(const char *key, struct device *dev,
-	struct device_attribute *attr, const char *sysfsbuf, size_t count)
-{
-        u8 buf[1];
-	unsigned long val;
-        int ret;
-
-	/* Set a lower limit of 10%; unnecessary? */
-	if (kstrtoul(sysfsbuf, 10, &val) < 0 || val < 10 || val > 100)
-		return -EINVAL;
-
-	buf[0] = (u8)val;
-
-	mutex_lock(&smcreg.mutex);
-	ret = write_smc(APPLESMC_WRITE_CMD, key, buf, sizeof(buf));
-	mutex_unlock(&smcreg.mutex);
-
-	if (ret)
-		return ret;
-
-	return count;
-}
-
-static ssize_t charge_control_start_threshold_show(struct device *dev,
-				struct device_attribute *attr, char *sysfsbuf)
-{
-	/* return applesmc_percent_show(CHARGE_START_KEY,
-					dev, attr, sysfsbuf); */
-	return sysfs_emit(sysfsbuf, "0\n");
-}
-
-static ssize_t charge_control_end_threshold_show(struct device *dev,
-				struct device_attribute *attr, char *sysfsbuf)
-{
-	return applesmc_percent_show(CHARGE_END_KEY, dev, attr, sysfsbuf);
-}
-
-static ssize_t charge_control_end_threshold_store(struct device *dev,
-	struct device_attribute *attr, const char *sysfsbuf, size_t count)
-{
-	return applesmc_percent_store(CHARGE_END_KEY,
-					dev, attr, sysfsbuf, count);
-}
-
-static ssize_t charge_control_full_threshold_show(struct device *dev,
-				struct device_attribute *attr, char *sysfsbuf)
-{
-	return applesmc_percent_show(CHARGE_FULL_KEY,
-					dev, attr, sysfsbuf);
-}
-
-static ssize_t charge_control_full_threshold_store(struct device *dev,
-	struct device_attribute *attr, const char *sysfsbuf, size_t count)
-{
-	return applesmc_percent_store(CHARGE_FULL_KEY,
-					dev, attr, sysfsbuf, count);
-}
-
-static DEVICE_ATTR_RO(charge_control_start_threshold);
-static DEVICE_ATTR_RW(charge_control_end_threshold);
-static DEVICE_ATTR_RW(charge_control_full_threshold);
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0)
-static int applesmc_battery_add(struct power_supply *battery, struct acpi_battery_hook* hook)
-#else
-static int applesmc_battery_add(struct power_supply *battery)
-#endif
-{
-	pr_debug("Battery added: %s\n", battery->desc->name);
-
-	if (device_create_file(&battery->dev,
-	    &dev_attr_charge_control_start_threshold))
-		goto out;
-
-	if (device_create_file(&battery->dev,
-	    &dev_attr_charge_control_end_threshold))
-		goto out_start;
-
-	if (device_create_file(&battery->dev,
-	    &dev_attr_charge_control_full_threshold))
-		goto out_end;
-
-	return 0;
-
-out_end:
-	device_remove_file(&battery->dev,
-			&dev_attr_charge_control_end_threshold);
-out_start:
-	device_remove_file(&battery->dev,
-			&dev_attr_charge_control_start_threshold);
-out:
-	return -ENODEV;
-}
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0)
-static int applesmc_battery_remove(struct power_supply *battery, struct acpi_battery_hook* hook)
-#else
-static int applesmc_battery_remove(struct power_supply *battery)
-#endif
-{
-	pr_debug("Battery removed: %s\n", battery->desc->name);
-
-	device_remove_file(&battery->dev,
-			&dev_attr_charge_control_full_threshold);
-	device_remove_file(&battery->dev,
-			&dev_attr_charge_control_end_threshold);
-	device_remove_file(&battery->dev,
-			&dev_attr_charge_control_start_threshold);
-	return 0;
-}
-
-static struct acpi_battery_hook battery_hook = {
-	.add_battery = applesmc_battery_add,
-	.remove_battery = applesmc_battery_remove,
-	.name = "AppleSMC Battery Charge Extension",
-};
-
-static void applesmc_battery_init(void)
-{
-	sbs_hook_register(&battery_hook);
-}
-
-static void applesmc_battery_exit(void)
-{
-	sbs_hook_unregister(&battery_hook);
 }
 
 /* Create accelerometer resources */
@@ -1480,6 +1458,7 @@ static const struct dmi_system_id applesmc_whitelist[] __initconst = {
 	},
 	{ .ident = NULL }
 };
+MODULE_DEVICE_TABLE(dmi, applesmc_whitelist);
 
 static int __init applesmc_init(void)
 {
@@ -1537,14 +1516,11 @@ static int __init applesmc_init(void)
 	if (ret)
 		goto out_light_sysfs;
 
-	/* FIXME: Deprecated hwmon interface */
 	hwmon_dev = hwmon_device_register(&pdev->dev);
 	if (IS_ERR(hwmon_dev)) {
 		ret = PTR_ERR(hwmon_dev);
 		goto out_light_ledclass;
 	}
-
-	applesmc_battery_init();
 
 	return 0;
 
@@ -1594,6 +1570,5 @@ module_exit(applesmc_exit);
 
 MODULE_AUTHOR("Nicolas Boichat");
 MODULE_DESCRIPTION("Apple SMC");
-MODULE_LICENSE("GPL v2");
-MODULE_DEVICE_TABLE(dmi, applesmc_whitelist);
 MODULE_VERSION("0.1.5-next");
+MODULE_LICENSE("GPL v2");

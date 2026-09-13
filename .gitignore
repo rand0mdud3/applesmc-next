@@ -1,0 +1,11 @@
+pristine-7.2.3/
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+Module.symvers
+modules.order
+.modules.order.cmd
+.Module.symvers.cmd
+.*.cmd

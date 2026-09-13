@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-obj-y      := applesmc/ sbs/
+obj-y      := applesmc/
 KVER       ?= `uname -r`
 KBASE      ?= /lib/modules/$(KVER)
 KBUILD_DIR ?= $(KBASE)/build
