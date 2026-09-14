@@ -674,10 +674,13 @@ static int applesmc_init_smcreg(void)
 
 /* Battery charge thresholds via SMC BCLM/BFCL keys.
  *
- * Registers an ACPI battery hook so the standard charge_control_* sysfs
- * files appear on the battery device. Reads and writes go through this
- * driver's own SMC accessors under smcreg.mutex, like every other node.
+ * Notification entry points live in the SBS battery driver, which owns
+ * battery add/remove events; declared here rather than in a shared header
+ * to keep the coupling to these two calls.
  */
+void sbs_hook_register(struct acpi_battery_hook *hook);
+void sbs_hook_unregister(struct acpi_battery_hook *hook);
+
 static ssize_t applesmc_percent_show(const char *key, struct device *dev,
 				struct device_attribute *attr, char *sysfsbuf)
 {
@@ -811,12 +814,12 @@ static struct acpi_battery_hook battery_hook = {
 
 static void applesmc_battery_init(void)
 {
-	battery_hook_register(&battery_hook);
+	sbs_hook_register(&battery_hook);
 }
 
 static void applesmc_battery_exit(void)
 {
-	battery_hook_unregister(&battery_hook);
+	sbs_hook_unregister(&battery_hook);
 }
 
 /* Device model stuff */
